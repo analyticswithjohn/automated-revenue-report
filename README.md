@@ -38,15 +38,17 @@ Historically, preparing the full revenue report manually takes 35–49 hours acr
 This automation significantly reduces the manual workload, minimizes rework, and accelerates review cycles.
 
 Project Structure
-Phase	Description	Estimated Hours Saved
-Phase 1 – File Setup & Core Preprocessing	Import source files, configure workspace, derive key fields (profit center, cost element), create merged dataset, flip revenue signs for reporting, and insert base columns for downstream phases.	3–5 hours
-Phase 2 – Data Enrichment & RAR Reconciliation	Pull customer details, contract IDs, and metadata from journal entries and RAR. Perform reconciliation between Merge and RAR, align performance obligations, validate contract-level totals, and run matching algorithms (e.g., customer ID + contract ID keying).	8–9 hours
-Phase 3 – PIT/OT Alignment & Adjustments	Load >$50k contract schedule prepared by technical accounting. Assign PIT/OT classification and revenue type to matching contracts. Add adjustment logic, potentially creating new lines when needed, ensuring adjustment columns net to zero while preserving contract ID and cost element constraints.	7–9 hours
-Phase 4 – Global Parent & Strategic Customer Mapping	Map customers to Global Parent Name & Country. Identify core strategic customers (used in internal reporting akin to “top accounts” or “key enterprise customers”).	1–3 hours
-Phase 5 – Financial Reporting Summaries	Prepare summaries used for financial statements and disclosures, including internal narratives (N1, N2, N3) and SEC disclosures such as: 10-Q / 10-K, ASC 606 disaggregation, and MD&A revenue commentary inputs.	3–5 hours
-Phase 6 – Comprehensive Validations & Close Activities	Pull trial balance, re-run reports after reclasses, reconcile movements versus prior periods, and ensure system-to-ledger tie-outs. Heavy validation stage.	6–8 hours
-Phase 7 – Post-Close Aggregation	Combine the newly-closed quarter with historical data. Perform continuity checks, consistency audits, and metric alignment.	4–6 hours
-Phase 8 – BI Publishing (Future Phase)	Publish validated datasets to a data analytics platform (e.g., Power BI, Tableau). Establish a persistent live data feed for automated refreshes.	3–4 hours (est.)
+| Phase | Description | Estimated Hours Saved |
+|-------|-------------|------------------------|
+| **Phase 1 – File Setup & Core Preprocessing** | Import source files, configure workspace, derive key fields (profit center, cost element), create merged dataset, flip revenue signs for reporting, and insert base columns for downstream phases. | **3–5 hours** |
+| **Phase 2 – Data Enrichment & RAR Reconciliation** | Pull customer details, contract IDs, and metadata from journal entries and RAR. Perform reconciliation between Merge and RAR, align performance obligations, validate contract-level totals, and run matching algorithms (e.g., customer ID + contract ID keying). | **8–9 hours** |
+| **Phase 3 – PIT/OT Alignment & Adjustments** | Load >$50k contract schedule prepared by technical accounting. Assign PIT/OT classification and revenue type to matching contracts. Add adjustment logic, potentially creating new lines when needed, ensuring adjustment columns net to zero while preserving contract ID and cost element constraints. | **7–9 hours** |
+| **Phase 4 – Global Parent & Strategic Customer Mapping** | Map customers to Global Parent Name & Country. Identify core strategic customers (used in internal reporting akin to “top accounts” or “key enterprise customers”). | **1–3 hours** |
+| **Phase 5 – Financial Reporting Summaries** | Prepare summaries used for financial statements and disclosures including internal narratives (N1, N2, N3) and SEC disclosures such as 10-Q/10-K, ASC 606 disaggregation, and MD&A revenue commentary inputs. | **3–5 hours** |
+| **Phase 6 – Comprehensive Validations & Close Activities** | Pull trial balance, re-run reports after reclasses, reconcile movements versus prior periods, and ensure system-to-ledger tie-outs. | **6–8 hours** |
+| **Phase 7 – Post-Close Aggregation** | Combine the newly-closed quarter with historical data. Perform continuity checks, consistency audits, and metric alignment. | **4–6 hours** |
+| **Phase 8 – BI Publishing (Future Phase)** | Publish validated datasets to a data analytics platform (e.g., Power BI, Tableau). Establish a persistent live data feed for automated refreshes. | **3–4 hours (est.)** |
+
 Technology Stack
 
 Python (pandas, openpyxl, pathlib, numpy)
