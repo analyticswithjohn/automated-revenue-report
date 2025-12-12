@@ -1,0 +1,456 @@
+"""
+Phase 1 – Revenue Automation Pipeline
+
+This script:
+1. Loads two CSV source files:
+   - Main revenue report
+   - RAR / profitability detail report
+2. Derives profit center and cost element codes.
+3. Selects a curated set of columns into a "Merge" sheet.
+4. Flips revenue into a "reporting amount" (credits shown as positive).
+5. Categorizes revenue (royalty / silicon / license) based on cost element.
+6. Creates:
+   - S1: Original lines (migration-related)
+   - S1: Reversal lines (sign-flipped duplicates of S1 originals)
+   - S2: RAR lines (detail lines matched on profitability segment)
+7. Writes everything into an Excel file with a "Merge" tab and a
+   "Validations" tab that contains Excel formulas to verify:
+   - S1 Original + S1 Reversal net to 0
+   - S1 Reversal + S2 RAR net to 0
+   - Row counts reconcile back to the main report
+"""
+
+from pathlib import Path
+import sys
+from typing import Dict, List
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+# Base paths (adjust as needed)
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "data" / "input"
+OUTPUT_DIR = BASE_DIR / "data" / "output"
+
+# Input files (CSV)
+MAIN_REPORT_FILE = INPUT_DIR / "main_revenue_report.csv"
+RAR_DETAIL_FILE = INPUT_DIR / "rar_detail.csv"
+
+# Output Excel file
+OUTPUT_EXCEL_FILE = OUTPUT_DIR / "revenue_automation_phase1.xlsx"
+
+# Columns we want to keep from the main report, in order.
+# Adjust names to match your actual CSV headers.
+COLUMNS_TO_KEEP: List[str] = [
+    "CompanyCode",
+    "FiscalYear",
+    "PostingPeriod",
+    "DocumentNumber",
+    "LineItem",
+    "ContractID",
+    "CustomerName",
+    "MaterialNumber",
+    "ProfitabilitySegment",
+    "ProfitCenterRaw",   # used to derive ProfitCenter
+    "CostElementRaw",    # used to derive CostElement
+    "RevenueAmount",
+    "Currency",
+    "PostingDate",
+    "SAPTransactionCode",
+    "Region",
+    "BusinessUnit",
+    "ProductFamily",
+    "SalesOrg",
+    "PostingKey",
+]
+
+# Name of the main amount column in the original report
+ORIGINAL_AMOUNT_COL = "RevenueAmount"
+
+# Derived columns
+PROFIT_CENTER_COL = "ProfitCenter"
+COST_ELEMENT_COL = "CostElement"
+ORIGINAL_AMOUNT_DERIVED_COL = "OriginalAmount"
+REPORTING_AMOUNT_COL = "ReportingAmount"
+REVENUE_CATEGORY_COL = "RevenueCategory"
+NOTE_COL = "Note"
+
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def ensure_paths_exist() -> None:
+    """Check input files and ensure output directory exists."""
+    missing = []
+    if not MAIN_REPORT_FILE.exists():
+        missing.append(str(MAIN_REPORT_FILE))
+    if not RAR_DETAIL_FILE.exists():
+        missing.append(str(RAR_DETAIL_FILE))
+
+    if missing:
+        print("ERROR: The following input files are missing:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        sys.exit(1)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def classify_revenue(cost_element: str) -> str:
+    """
+    Classify revenue category based on the (5-digit) cost element / G/L account.
+
+    Example logic:
+      - Starts with '76' → Royalty
+      - Starts with '78' → Silicon
+      - Otherwise       → License
+    """
+    if not isinstance(cost_element, str):
+        return "License"
+
+    ce = cost_element.strip()
+    if ce.startswith("76"):
+        return "Royalty"
+    if ce.startswith("78"):
+        return "Silicon"
+    return "License"
+
+
+def prepare_main_report(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare the main revenue report:
+      - Keep a curated set of columns (if present).
+      - Derive ProfitCenter (last 6 digits of ProfitCenterRaw).
+      - Derive CostElement (last 5 digits of CostElementRaw).
+      - Rename RevenueAmount → OriginalAmount.
+      - Create ReportingAmount (sign-flipped).
+      - Categorize revenue.
+      - Add Note column (blank for now).
+    """
+    # Keep only requested columns that exist in the input
+    existing_cols = [c for c in COLUMNS_TO_KEEP if c in df.columns]
+    missing_cols = [c for c in COLUMNS_TO_KEEP if c not in df.columns]
+
+    if missing_cols:
+        print("WARNING: The following expected columns are missing from "
+              "the main report CSV and will be skipped:")
+        for c in missing_cols:
+            print(f"  - {c}")
+
+    df = df[existing_cols].copy()
+
+    # Derive profit center and cost element
+    if "ProfitCenterRaw" in df.columns:
+        df[PROFIT_CENTER_COL] = df["ProfitCenterRaw"].astype(str).str[-6:]
+    else:
+        df[PROFIT_CENTER_COL] = ""
+
+    if "CostElementRaw" in df.columns:
+        # Use last 5 digits as the "G/L account"
+        df[COST_ELEMENT_COL] = df["CostElementRaw"].astype(str).str[-5:]
+    else:
+        df[COST_ELEMENT_COL] = ""
+
+    # Rename amount column to OriginalAmount
+    if ORIGINAL_AMOUNT_COL not in df.columns:
+        raise KeyError(
+            f"Main report is missing expected amount column '{ORIGINAL_AMOUNT_COL}'"
+        )
+
+    df[ORIGINAL_AMOUNT_DERIVED_COL] = df[ORIGINAL_AMOUNT_COL]
+    # Optionally keep the original column; if not needed, we could drop it:
+    # df.drop(columns=[ORIGINAL_AMOUNT_COL], inplace=True)
+
+    # Flip sign for reporting amount (credit as positive)
+    df[REPORTING_AMOUNT_COL] = -df[ORIGINAL_AMOUNT_DERIVED_COL].fillna(0)
+
+    # Revenue category
+    df[REVENUE_CATEGORY_COL] = df[COST_ELEMENT_COL].astype(str).apply(classify_revenue)
+
+    # Note column (start blank)
+    df[NOTE_COL] = ""
+
+    return df
+
+
+def create_s1_originals_and_reversals(merge_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    S1 logic:
+      - Identify "original" lines for system migration:
+          * Customer is blank
+          * SAPTransactionCode == 'FARA'  (can be adjusted)
+      - Tag them as Note = 'S1: Original'.
+      - Create S1 reversal lines by duplicating them and flipping both
+        OriginalAmount and ReportingAmount signs, tagging as Note = 'S1: Reversal'.
+    """
+    df = merge_df.copy()
+
+    customer_col = "CustomerName"
+    tcode_col = "SAPTransactionCode"
+
+    if customer_col not in df.columns or tcode_col not in df.columns:
+        print("WARNING: Cannot apply S1 logic because required columns "
+              f"'{customer_col}' or '{tcode_col}' are missing.")
+        return df
+
+    # Identify S1 originals
+    customer_blank = df[customer_col].fillna("").astype(str).str.strip() == ""
+    tcode_fara = df[tcode_col].astype(str).str.upper() == "FARA"
+    s1_mask = customer_blank & tcode_fara
+
+    df.loc[s1_mask, NOTE_COL] = "S1: Original"
+
+    # Build S1 reversal lines
+    s1_originals = df.loc[s1_mask].copy()
+    if s1_originals.empty:
+        return df
+
+    # Flip both amounts
+    for amt_col in [ORIGINAL_AMOUNT_DERIVED_COL, REPORTING_AMOUNT_COL]:
+        if amt_col in s1_originals.columns:
+            s1_originals[amt_col] = -s1_originals[amt_col].fillna(0)
+
+    s1_originals[NOTE_COL] = "S1: Reversal"
+
+    # Append reversals to merge
+    df = pd.concat([df, s1_originals], ignore_index=True)
+
+    return df
+
+
+def create_s2_rar_lines(merge_df: pd.DataFrame, rar_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    S2 logic:
+      - Take all profitability segments from S1: Original lines.
+      - For each matching profitability segment in the RAR detail, create new lines
+        in the merge with:
+          * mapped columns (Customer, CostElement, etc.)
+          * OriginalAmount from RAR
+          * ReportingAmount = -OriginalAmount
+          * Note = 'S2: RAR'
+    """
+    df = merge_df.copy()
+
+    if "ProfitabilitySegment" not in df.columns:
+        print("WARNING: Cannot create S2: RAR lines because 'ProfitabilitySegment' "
+              "is missing from the merge dataframe.")
+        return df
+
+    if "ProfitabilitySegment" not in rar_df.columns:
+        print("WARNING: Cannot create S2: RAR lines because 'ProfitabilitySegment' "
+              "is missing from the RAR dataframe.")
+        return df
+
+    # Get S1 Original segments
+    s1_originals = df[df[NOTE_COL] == "S1: Original"].copy()
+    if s1_originals.empty:
+        # No S1 originals → nothing to map
+        return df
+
+    segments = s1_originals["ProfitabilitySegment"].dropna().unique()
+    if len(segments) == 0:
+        return df
+
+    # Filter RAR lines by those segments
+    rar_match = rar_df[rar_df["ProfitabilitySegment"].isin(segments)].copy()
+    if rar_match.empty:
+        print("WARNING: No matching RAR lines found for S1 Original segments.")
+        return df
+
+    # Ensure basic columns exist in RAR. Adjust these as needed.
+    # We’ll align by common column names where possible.
+    common_cols = [c for c in df.columns if c in rar_match.columns]
+
+    rar_for_merge = rar_match[common_cols].copy()
+
+    # If RAR has its own raw profit center / cost element columns, derive them
+    if "ProfitCenterRaw" in rar_for_merge.columns:
+        rar_for_merge[PROFIT_CENTER_COL] = (
+            rar_for_merge["ProfitCenterRaw"].astype(str).str[-6:]
+        )
+
+    if "CostElementRaw" in rar_for_merge.columns:
+        rar_for_merge[COST_ELEMENT_COL] = (
+            rar_for_merge["CostElementRaw"].astype(str).str[-5:]
+        )
+
+    # Amount logic: use RevenueAmount if present, else 0
+    if ORIGINAL_AMOUNT_COL in rar_for_merge.columns:
+        rar_for_merge[ORIGINAL_AMOUNT_DERIVED_COL] = rar_for_merge[ORIGINAL_AMOUNT_COL]
+    elif ORIGINAL_AMOUNT_DERIVED_COL not in rar_for_merge.columns:
+        rar_for_merge[ORIGINAL_AMOUNT_DERIVED_COL] = 0.0
+
+    rar_for_merge[REPORTING_AMOUNT_COL] = -rar_for_merge[ORIGINAL_AMOUNT_DERIVED_COL]
+
+    # Revenue category
+    rar_for_merge[REVENUE_CATEGORY_COL] = (
+        rar_for_merge.get(COST_ELEMENT_COL, "").astype(str).apply(classify_revenue)
+    )
+
+    # Note
+    rar_for_merge[NOTE_COL] = "S2: RAR"
+
+    # Align columns with merge_df (missing columns → filled with NaN)
+    for col in df.columns:
+        if col not in rar_for_merge.columns:
+            rar_for_merge[col] = pd.NA
+
+    rar_for_merge = rar_for_merge[df.columns]  # order columns same as merge
+
+    # Append to merge
+    df = pd.concat([df, rar_for_merge], ignore_index=True)
+
+    return df
+
+
+def write_merge_to_excel(merge_df: pd.DataFrame, original_row_count: int) -> None:
+    """
+    Writes the merge_df to Excel (sheet 'Merge') and adds a 'Validations' sheet
+    with formulas to check:
+      - S1 Original + S1 Reversal net to 0
+      - S1 Reversal + S2 RAR net to 0
+      - Row counts reconcile back to original report
+    """
+    # 1) Write Merge sheet with pandas
+    with pd.ExcelWriter(OUTPUT_EXCEL_FILE, engine="openpyxl") as writer:
+        merge_df.to_excel(writer, sheet_name="Merge", index=False)
+
+    # 2) Load workbook with openpyxl to add formulas
+    wb = load_workbook(OUTPUT_EXCEL_FILE)
+    ws_merge = wb["Merge"]
+
+    # Build a map of header name → column index
+    header_cells = next(ws_merge.iter_rows(min_row=1, max_row=1))
+    header_map: Dict[str, int] = {cell.value: cell.col_idx for cell in header_cells}
+
+    def col_letter(col_name: str) -> str:
+        idx = header_map.get(col_name)
+        if idx is None:
+            raise KeyError(f"Column '{col_name}' not found on Merge sheet.")
+        return get_column_letter(idx)
+
+    # Column letters we need
+    orig_amt_letter = col_letter(ORIGINAL_AMOUNT_DERIVED_COL)
+    rpt_amt_letter = col_letter(REPORTING_AMOUNT_COL)
+    note_letter = col_letter(NOTE_COL)
+
+    # Range references (whole column)
+    orig_amt_range = f"{orig_amt_letter}:{orig_amt_letter}"
+    rpt_amt_range = f"{rpt_amt_letter}:{rpt_amt_letter}"
+    note_range = f"{note_letter}:{note_letter}"
+
+    # Create Validations sheet
+    ws_val = wb.create_sheet("Validations")
+
+    # Header row
+    ws_val["A1"] = "Check Description"
+    ws_val["B1"] = "Excel Formula"
+    ws_val["C1"] = "Expected"
+    ws_val["D1"] = "Match?"
+
+    row = 2
+
+    # 1) S1 Original + S1 Reversal net to 0 (OriginalAmount)
+    ws_val[f"A{row}"] = "S1 Original + S1 Reversal net to 0 (OriginalAmount)"
+    ws_val[f"B{row}"] = (
+        f'=SUMIFS(Merge!${orig_amt_letter}:${orig_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Original")'
+        f'+SUMIFS(Merge!${orig_amt_letter}:${orig_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Reversal")'
+    )
+    ws_val[f"C{row}"] = 0
+    ws_val[f"D{row}"] = f'=IF(ROUND(B{row}-C{row},2)=0,"OK","Check")'
+    row += 1
+
+    # 2) S1 Original + S1 Reversal net to 0 (ReportingAmount)
+    ws_val[f"A{row}"] = "S1 Original + S1 Reversal net to 0 (ReportingAmount)"
+    ws_val[f"B{row}"] = (
+        f'=SUMIFS(Merge!${rpt_amt_letter}:${rpt_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Original")'
+        f'+SUMIFS(Merge!${rpt_amt_letter}:${rpt_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Reversal")'
+    )
+    ws_val[f"C{row}"] = 0
+    ws_val[f"D{row}"] = f'=IF(ROUND(B{row}-C{row},2)=0,"OK","Check")'
+    row += 1
+
+    # 3) S1 Reversal + S2 RAR net to 0 (OriginalAmount)
+    ws_val[f"A{row}"] = "S1 Reversal + S2 RAR net to 0 (OriginalAmount)"
+    ws_val[f"B{row}"] = (
+        f'=SUMIFS(Merge!${orig_amt_letter}:${orig_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Reversal")'
+        f'+SUMIFS(Merge!${orig_amt_letter}:${orig_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S2: RAR")'
+    )
+    ws_val[f"C{row}"] = 0
+    ws_val[f"D{row}"] = f'=IF(ROUND(B{row}-C{row},2)=0,"OK","Check")'
+    row += 1
+
+    # 4) S1 Reversal + S2 RAR net to 0 (ReportingAmount)
+    ws_val[f"A{row}"] = "S1 Reversal + S2 RAR net to 0 (ReportingAmount)"
+    ws_val[f"B{row}"] = (
+        f'=SUMIFS(Merge!${rpt_amt_letter}:${rpt_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S1: Reversal")'
+        f'+SUMIFS(Merge!${rpt_amt_letter}:${rpt_amt_letter},'
+        f'Merge!${note_letter}:${note_letter},"S2: RAR")'
+    )
+    ws_val[f"C{row}"] = 0
+    ws_val[f"D{row}"] = f'=IF(ROUND(B{row}-C{row},2)=0,"OK","Check")'
+    row += 1
+
+    # 5) Row count reconciliation
+    ws_val[f"A{row}"] = (
+        "Row count: Merge minus S1 Reversal and S2 RAR "
+        "= original main report row count"
+    )
+    ws_val[f"B{row}"] = (
+        f"=ROWS(Merge!$A:$A)"
+        f'-COUNTIF(Merge!${note_range},"S1: Reversal")'
+        f'-COUNTIF(Merge!${note_range},"S2: RAR")'
+    )
+    ws_val[f"C{row}"] = int(original_row_count)
+    ws_val[f"D{row}"] = f'=IF(B{row}=C{row},"OK","Check")'
+
+    wb.save(OUTPUT_EXCEL_FILE)
+
+
+# -----------------------------------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------------------------------
+
+def main() -> None:
+    ensure_paths_exist()
+
+    # Load CSVs
+    main_df = pd.read_csv(MAIN_REPORT_FILE)
+    rar_df = pd.read_csv(RAR_DETAIL_FILE)
+
+    original_row_count = len(main_df)
+
+    # Prepare main report into merge dataframe
+    merge_df = prepare_main_report(main_df)
+
+    # S1: Original and Reversal lines
+    merge_df = create_s1_originals_and_reversals(merge_df)
+
+    # S2: RAR lines
+    merge_df = create_s2_rar_lines(merge_df, rar_df)
+
+    # Write to Excel with validations tab
+    write_merge_to_excel(merge_df, original_row_count)
+
+    print(f"Phase 1 revenue automation complete.")
+    print(f"Input main report: {MAIN_REPORT_FILE}")
+    print(f"Input RAR detail: {RAR_DETAIL_FILE}")
+    print(f"Output Excel:     {OUTPUT_EXCEL_FILE}")
+
+
+if __name__ == "__main__":
+    main()
