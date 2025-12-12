@@ -454,3 +454,22 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# -------------------------------------------------------------------------
+# Freeze panes on all sheets and finalize workbook
+# -------------------------------------------------------------------------
+
+wb = load_workbook(OUTPUT_EXCEL_FILE)
+
+for ws in wb.worksheets:
+    # Freeze first row
+    ws.freeze_panes = "A2"
+
+wb.save(OUTPUT_EXCEL_FILE)
+
+print("\n--------------------------------------------")
+print("Phase 1 Complete")
+print("✔ All sheets generated")
+print("✔ Freeze panes applied to all sheets")
+print(f"✔ Output saved to: {OUTPUT_EXCEL_FILE}")
+print("--------------------------------------------\n")
