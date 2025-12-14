@@ -46,6 +46,8 @@ from typing import Tuple, List, Optional, Dict
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
+
 
 
 # =============================================================================
@@ -583,60 +585,87 @@ def run_phase2_step1_matching(
 
 
 # =============================================================================
-# Optional CLI / script entrypoint (for local testing)
+# Optional CLI / script entrypoint (for local testing / scheduled use)
 # =============================================================================
 
 def main(
     merge_path: Path,
     rar_path: Path,
-    output_merge_path: Optional[Path] = None,
-    output_rar_path: Optional[Path] = None,
+    output_excel_path: Optional[Path] = None,
 ) -> None:
     """
-    Convenience entrypoint for local development/testing.
+    Convenience entrypoint for local development, testing, and scheduled runs.
+
+    Input:
+        - CSV files (e.g., scheduled SAP exports).
+
+    Output:
+        - A single Excel workbook (.xlsx) with:
+            * Sheet 'Merge_Matched' – Merge file with all Phase 2 Step 1 flags
+            * Sheet 'RAR_Matched'   – RAR file with all Phase 2 Step 1 flags
 
     Example:
         python phase2_matching.py \
             data/output/phase1_merge.csv \
             data/input/rar_detail.csv \
-            data/output/phase2_merge_matched.csv \
-            data/output/phase2_rar_matched.csv
+            data/output/phase2_matching_output.xlsx
     """
     print("--------------------------------------------------")
     print("Phase 2 – Step 1: Matching Engine")
-    print("Loading input files...")
-    print(f"  Merge file (input): {merge_path}")
-    print(f"  RAR file   (input): {rar_path}")
+    print("Loading CSV input files...")
+    print(f"  Merge file (CSV): {merge_path}")
+    print(f"  RAR file   (CSV): {rar_path}")
     print("--------------------------------------------------")
 
+    # 1) Read CSV inputs
     merge_df = pd.read_csv(merge_path)
     rar_df = pd.read_csv(rar_path)
 
+    # 2) Run matching logic
     merge_df, rar_df = run_phase2_step1_matching(merge_df, rar_df)
 
-    output_merge_path = output_merge_path or merge_path.with_name(
-        merge_path.stem + "_phase2_matched.csv"
-    )
-    output_rar_path = output_rar_path or rar_path.with_name(
-        rar_path.stem + "_phase2_matched.csv"
-    )
+    # 3) Determine Excel output path
+    if output_excel_path is None:
+        # Default: same folder as merge CSV, with a descriptive name
+        output_excel_path = merge_path.with_name("phase2_matching_output.xlsx")
 
-    merge_df.to_csv(output_merge_path, index=False)
-    rar_df.to_csv(output_rar_path, index=False)
+    # 4) Write to a single Excel workbook with two sheets
+    with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+        merge_df.to_excel(writer, sheet_name="Merge_Matched", index=False)
+        rar_df.to_excel(writer, sheet_name="RAR_Matched", index=False)
 
+    # 5) Re-open workbook to apply freeze panes on all sheets
+    wb = load_workbook(output_excel_path)
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"  # keep header row visible when scrolling
+    wb.save(output_excel_path)
+
+    # 6) Status + documentation of new columns
     print("\nPhase 2 – Step 1 matching complete.")
     print("----------------------------------------")
-    print("Files saved:")
-    print(f"  Merge (with matches): {output_merge_path}")
-    print(f"  RAR   (with matches): {output_rar_path}")
-    print("\nNew columns created on BOTH datasets (Merge & RAR):")
-    for col in NEW_MATCH_COLUMNS:
-        print(f"  - {col}")
+    print("Excel workbook saved:")
+    print(f"  {output_excel_path}")
+    print("\nNew columns created on BOTH sheets ('Merge_Matched' and 'RAR_Matched'):")
+    print("  - Match 1      (Y/blank flag for POB-level matches)")
+    print("  - Match 2a     (Y/blank flag for Contract-level matches)")
+    print("  - Match 2b     (Y/blank flag for Profitability Segment matches)")
+    print("  - Match 3a     (Y/blank flag for Customer + Cost Element matches)")
+    print("  - Match 3b     (Y/blank flag for Customer-total matches)")
+    print("  - MatchStatus  (final classification per line, e.g., 'Match 2a – Contract',")
+    print("                  'Net 0 (Contract)', 'Manual JE', etc.)")
+    print("  - UpdatedPerformanceObligation")
+    print("        • For Match 1: mirrors the original POB (1:1 mapping).")
+    print("        • For Match 2a/2b/3a/3b: aggregates one or more RAR POB IDs")
+    print("          into a comma-separated list (TEXTJOIN-style behavior).")
     print("\nNotes:")
-    print("  • Months 1 and 2 may still show small variances after matching")
-    print("    due to timing cutoffs or system posting quirks.")
-    print("  • By Month 3, those variances should clear and all License lines")
-    print("    should be reconciled via Match 1–3 or explained as Net 0 / Manual JE.")
+    print("  • Months 1 and 2 may still show variances after matching due to")
+    print("    timing cutoffs or system posting quirks.")
+    print("  • By Month 3, those variances should be cleared, and License lines")
+    print("    should be fully reconciled through Match 1–3 or explicitly")
+    print("    explained as Net 0 (full reversals) or Manual JE.")
+    print("  • 'Net 0 (Contract)' lines on the Merge file represent contracts")
+    print("    where postings net to zero with no corresponding RAR activity –")
+    print("    often contract cancellations, undelivered product, or full reversals.")
     print("----------------------------------------\n")
 
 
@@ -647,19 +676,17 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(
             "Usage: python phase2_matching.py <merge_csv> <rar_csv> "
-            "[<output_merge_csv> <output_rar_csv>]"
+            "[<output_excel_path>]"
         )
         sys.exit(1)
 
     merge_path_arg = Path(sys.argv[1])
     rar_path_arg = Path(sys.argv[2])
 
-    out_merge_arg = Path(sys.argv[3]) if len(sys.argv) >= 4 else None
-    out_rar_arg = Path(sys.argv[4]) if len(sys.argv) >= 5 else None
+    out_excel_arg = Path(sys.argv[3]) if len(sys.argv) >= 4 else None
 
     main(
         merge_path=merge_path_arg,
         rar_path=rar_path_arg,
-        output_merge_path=out_merge_arg,
-        output_rar_path=out_rar_arg,
+        output_excel_path=out_excel_arg,
     )
