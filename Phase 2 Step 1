@@ -1,0 +1,665 @@
+"""
+Phase 2 – Step 1: Matching Logic Between Merge (COPA) and RAR
+
+This module implements the core matching logic to reconcile the "Merge" file
+(e.g., COPA / revenue report) against the RAR / revenue waterfall schedule.
+
+Goal:
+    - Systematically reconcile License revenue between Merge and RAR.
+    - Work through increasingly coarse matching tiers:
+        Match 1  : Performance Obligation (POB-level)
+        Match 2a : Contract ID
+        Match 2b : Profitability Segment
+        Match 3a : Customer + Cost Element / G/L
+        Match 3b : Customer total
+    - Identify Net 0 patterns (reversals within Merge with no RAR counterpart).
+    - Populate:
+        * Match 1, Match 2a, Match 2b, Match 3a, Match 3b (flag columns)
+        * MatchStatus – final classification per line
+        * UpdatedPerformanceObligation – enriched/aggregated POB ID
+
+Multi-period behavior (Month 1 / Month 2 / Month 3):
+    - In months 1 and 2, it is normal to see residual variances even after
+      running all matching tiers. These typically arise from timing cutoffs,
+      late postings, or system-side allocation quirks.
+    - By month 3 (end of the quarter), the expectation is that those early
+      variances have cleared. The matching algorithm should fully reconcile
+      all License lines between Merge and RAR, leaving only edge-case items.
+
+Net 0 contracts:
+    - "Net 0" labels are critical for explaining situations where the Merge
+      file shows both positive and negative postings that net to zero for
+      a given Contract ID, while RAR shows no corresponding activity.
+    - Common drivers:
+        * Reversal of revenue due to undelivered or unreleased product
+        * Contract modifications / cancellations
+        * Corrections that fully reverse prior entries
+    - Rather than forcing a 1:1 match to RAR, these contracts are surfaced
+      as their own category: "Net 0".
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Amount column we reconcile on (already sign-flipped in Phase 1)
+AMOUNT_COL = "ReportingAmount"
+
+# Core identifier columns expected on both Merge and RAR
+POB_COL = "PerformanceObligationID"
+CONTRACT_COL = "ContractID"
+PROFIT_SEG_COL = "ProfitabilitySegment"
+CUSTOMER_COL = "CustomerID"           # or "CustomerName" – adjust as needed
+COST_ELEMENT_COL = "CostElement"
+TCODE_COL = "SAPTransactionCode"
+REVENUE_CATEGORY_COL = "RevenueCategory"  # e.g., "Royalty", "Silicon", "License"
+
+# Match status columns
+MATCH_STATUS_COL = "MatchStatus"
+MATCH_POPULATION_COL = "MatchPopulation"  # optional helper column
+UPDATED_POB_COL = "UpdatedPerformanceObligation"
+
+# Explicit tier flag columns (easy to filter in Excel / pivots)
+MATCH_1_COL = "Match 1"
+MATCH_2A_COL = "Match 2a"
+MATCH_2B_COL = "Match 2b"
+MATCH_3A_COL = "Match 3a"
+MATCH_3B_COL = "Match 3b"
+
+NEW_MATCH_COLUMNS = [
+    MATCH_1_COL,
+    MATCH_2A_COL,
+    MATCH_2B_COL,
+    MATCH_3A_COL,
+    MATCH_3B_COL,
+    MATCH_STATUS_COL,
+    UPDATED_POB_COL,
+    MATCH_POPULATION_COL,  # helper, optional
+]
+
+# Map from internal labels → tier flag column name
+MATCH_TIER_COLUMN_MAP: Dict[str, str] = {
+    "Match 1 – POB": MATCH_1_COL,
+    "Match 2a – Contract": MATCH_2A_COL,
+    "Match 2b – Profit Segment": MATCH_2B_COL,
+    "Match 3a – Customer+GL": MATCH_3A_COL,
+    "Match 3b – Customer": MATCH_3B_COL,
+}
+
+# Manual JE configuration
+MANUAL_JE_TCODES = {"BKPF", "BKPFF"}
+
+# Decimal precision for reconciliation
+AMOUNT_PRECISION = 2
+
+
+@dataclass
+class Phase2Config:
+    """
+    Configuration holder for Phase 2 Step 1.
+
+    You can extend this dataclass to include:
+      - multi-period context (month 1 / 2 / 3)
+      - tolerance thresholds
+      - filters for specific revenue types, regions, etc.
+    """
+    amount_col: str = AMOUNT_COL
+    pob_col: str = POB_COL
+    contract_col: str = CONTRACT_COL
+    profit_seg_col: str = PROFIT_SEG_COL
+    customer_col: str = CUSTOMER_COL
+    cost_element_col: str = COST_ELEMENT_COL
+    tcode_col: str = TCODE_COL
+    revenue_category_col: str = REVENUE_CATEGORY_COL
+    match_status_col: str = MATCH_STATUS_COL
+    match_population_col: str = MATCH_POPULATION_COL
+    updated_pob_col: str = UPDATED_POB_COL
+    amount_precision: int = AMOUNT_PRECISION
+
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
+
+def _round_amount(series: pd.Series, precision: int) -> pd.Series:
+    """
+    Round a numeric series to the specified decimal precision.
+
+    Rounding is critical because RAR/waterfall schedules often contain
+    floating-point artifacts from allocation logic.
+    """
+    return series.astype(float).round(precision)
+
+
+def _init_match_columns(df: pd.DataFrame, cfg: Phase2Config) -> pd.DataFrame:
+    """
+    Ensure the DataFrame has the match-related columns needed for Phase 2.
+
+    Columns added (if missing):
+        Match 1 / Match 2a / Match 2b / Match 3a / Match 3b – flag columns
+        MatchStatus              – string; final classification for each row
+        MatchPopulation          – helper; captures matching tier/tag
+        UpdatedPerformanceObligation – enriched POB field (starts as NaN)
+    """
+    # Main status & helper columns
+    if cfg.match_status_col not in df.columns:
+        df[cfg.match_status_col] = pd.NA
+
+    if cfg.match_population_col not in df.columns:
+        df[cfg.match_population_col] = pd.NA
+
+    if cfg.updated_pob_col not in df.columns:
+        df[cfg.updated_pob_col] = pd.NA
+
+    # Per-tier flags (stored as 'Y' / blank for easy Excel filters)
+    for col in NEW_MATCH_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+
+def _is_license_row(df: pd.DataFrame, cfg: Phase2Config) -> pd.Series:
+    """
+    Boolean mask for rows considered 'License' for matching purposes.
+
+    - Assumes `RevenueCategory` already exists from Phase 1.
+    - Royalty (e.g., cost elements starting with '76') is excluded here.
+
+    Adjust this if you want silicon or other revenue types in scope.
+    """
+    if cfg.revenue_category_col not in df.columns:
+        # If the category doesn't exist yet, treat everything as license.
+        return pd.Series(True, index=df.index)
+
+    return df[cfg.revenue_category_col].fillna("").str.upper().eq("LICENSE")
+
+
+def _mark_manual_journal_entries(df: pd.DataFrame, cfg: Phase2Config) -> pd.Series:
+    """
+    Identify manual journal entry lines based on transaction codes.
+
+    Logic:
+        - If SAP Transaction Code is in MANUAL_JE_TCODES
+          (e.g., BKPF, BKPFF), mark as 'Manual JE' in MatchStatus.
+        - These are excluded from License matching groups but still visible
+          in final reporting.
+
+    Returns:
+        Boolean Series indicating manual JE rows.
+    """
+    if cfg.tcode_col not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    mask = df[cfg.tcode_col].astype(str).str.upper().isin(MANUAL_JE_TCODES)
+
+    # Only overwrite MatchStatus where it is currently blank/NaN
+    df.loc[mask & df[cfg.match_status_col].isna(), cfg.match_status_col] = "Manual JE"
+    df.loc[mask & df[cfg.match_population_col].isna(), cfg.match_population_col] = "Manual JE"
+
+    return mask
+
+
+def _label_net_zero_contracts(
+    merge_df: pd.DataFrame,
+    rar_df: pd.DataFrame,
+    cfg: Phase2Config,
+) -> pd.DataFrame:
+    """
+    Label "Net 0" patterns on the Merge file.
+
+    Definition:
+        - For each Contract ID in Merge:
+            * Round the sum of the reporting amount to the configured precision.
+            * If the sum is 0 (Net 0), AND
+              that Contract ID does not appear in RAR,
+              THEN mark those rows as 'Net 0 (Contract)'.
+
+    Why this matters:
+        - Net 0 contracts often represent full reversals and should not be
+          forced into a POB-level or Contract-level match with RAR.
+        - Common scenarios:
+            * Product not delivered / not released to the customer
+            * Contract modifications that reverse the original revenue
+            * Corrections that fully offset prior period postings
+        - Surfacing them as a dedicated category makes the reconciliation
+          narrative much easier to explain to reviewers and auditors.
+    """
+    # Contract sums on Merge
+    grouped = (
+        merge_df
+        .groupby(cfg.contract_col)[cfg.amount_col]
+        .sum()
+        .pipe(_round_amount, cfg.amount_precision)
+    )
+
+    merge_contract_zero = grouped[grouped == 0].index
+
+    # Contract IDs on RAR
+    rar_contracts = set(rar_df[cfg.contract_col].dropna().unique())
+
+    # Contract IDs that are zero in Merge and missing in RAR
+    net_zero_contracts = [c for c in merge_contract_zero if c not in rar_contracts]
+
+    mask = merge_df[cfg.contract_col].isin(net_zero_contracts)
+    merge_df.loc[mask, cfg.match_status_col] = "Net 0 (Contract)"
+    merge_df.loc[mask, cfg.match_population_col] = "Net 0"
+
+    return merge_df
+
+
+def _group_match(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    group_cols: List[str],
+    label: str,
+    cfg: Phase2Config,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Generic group-based matching helper.
+
+    Logic:
+        1. Filter to License lines that do NOT yet have a MatchStatus.
+        2. Group by the specified `group_cols` and sum the amount column on
+           both sides (Merge/left and RAR/right).
+        3. Round to configured precision.
+        4. Identify keys where sums are equal between both datasets.
+        5. Mark all lines belonging to those keys with:
+             - MatchStatus = `label`
+             - MatchPopulation = `label`
+             - Corresponding tier flag column (Match 1, Match 2a, etc.) = 'Y'
+
+    This powers:
+        - Match 1  (PerformanceObligationID)
+        - Match 2a (ContractID)
+        - Match 2b (ProfitabilitySegment)
+        - Match 3a (Customer + Cost Element)
+        - Match 3b (Customer)
+    """
+    amt_col = cfg.amount_col
+
+    # Work only on license lines that are not yet matched
+    left_scope = (
+        _is_license_row(left_df, cfg)
+        & left_df[cfg.match_status_col].isna()
+    )
+    right_scope = (
+        _is_license_row(right_df, cfg)
+        & right_df[cfg.match_status_col].isna()
+    )
+
+    left_sub = left_df.loc[left_scope]
+    right_sub = right_df.loc[right_scope]
+
+    if left_sub.empty or right_sub.empty:
+        # Nothing to match at this tier
+        return left_df, right_df
+
+    # Summaries on each side
+    left_grouped = (
+        left_sub
+        .groupby(group_cols)[amt_col]
+        .sum()
+        .pipe(_round_amount, cfg.amount_precision)
+        .rename("left_sum")
+    )
+
+    right_grouped = (
+        right_sub
+        .groupby(group_cols)[amt_col]
+        .sum()
+        .pipe(_round_amount, cfg.amount_precision)
+        .rename("right_sum")
+    )
+
+    # Inner join where sums are equal
+    joined = (
+        left_grouped.to_frame()
+        .join(right_grouped.to_frame(), how="inner")
+        .query("left_sum == right_sum")
+    )
+
+    if joined.empty:
+        return left_df, right_df
+
+    matched_keys = joined.index
+
+    # Build a mask that identifies rows belonging to those matched groups
+    left_index = left_df.set_index(group_cols, drop=False).index
+    right_index = right_df.set_index(group_cols, drop=False).index
+
+    left_mask = left_scope & left_index.isin(matched_keys)
+    right_mask = right_scope & right_index.isin(matched_keys)
+
+    # Apply match labels
+    left_df.loc[left_mask, cfg.match_status_col] = label
+    left_df.loc[left_mask, cfg.match_population_col] = label
+
+    right_df.loc[right_mask, cfg.match_status_col] = label
+    right_df.loc[right_mask, cfg.match_population_col] = label
+
+    # Flag the corresponding tier column (Match 1, 2a, 2b, 3a, 3b)
+    tier_col = MATCH_TIER_COLUMN_MAP.get(label)
+    if tier_col:
+        if tier_col not in left_df.columns:
+            left_df[tier_col] = ""
+        if tier_col not in right_df.columns:
+            right_df[tier_col] = ""
+
+        left_df.loc[left_mask, tier_col] = "Y"
+        right_df.loc[right_mask, tier_col] = "Y"
+
+    return left_df, right_df
+
+
+def _update_pob_from_rar(
+    merge_df: pd.DataFrame,
+    rar_df: pd.DataFrame,
+    group_cols: List[str],
+    label: str,
+    cfg: Phase2Config,
+) -> pd.DataFrame:
+    """
+    Populate `UpdatedPerformanceObligation` on Merge for a given match tier.
+
+    Concept:
+        - For each matched group (e.g. Contract ID, Profitability Segment,
+          Customer + Cost Element, etc.), collect all unique POB IDs from RAR.
+        - Aggregate them into a comma-separated string (similar to Excel TEXTJOIN).
+        - For Merge rows in that group whose MatchStatus == `label`:
+              UpdatedPerformanceObligation = aggregated POB string.
+
+    Notes:
+        - For Match 1 (POB-level), we typically just mirror the original POB
+          because the mapping is already 1:1.
+        - For Match 2a/2b/3a/3b, COPA lines may not map 1:1 to RAR, so the
+          aggregated POB string documents exactly which RAR POBs are being
+          reconciled to each Merge line.
+    """
+    # Only consider RAR rows that were matched at this tier
+    rar_scope = rar_df[cfg.match_status_col].eq(label)
+
+    if rar_scope.any():
+        rar_sub = rar_df.loc[rar_scope, group_cols + [cfg.pob_col]].copy()
+    else:
+        return merge_df
+
+    # Aggregate unique POB IDs per group
+    agg = (
+        rar_sub
+        .dropna(subset=[cfg.pob_col])
+        .groupby(group_cols)[cfg.pob_col]
+        .apply(lambda s: ", ".join(sorted(map(str, set(s)))))
+        .rename("pob_agg")
+    )
+
+    if agg.empty:
+        return merge_df
+
+    # Map the aggregated POB string back to Merge
+    merge_index = merge_df.set_index(group_cols, drop=False).index
+    merge_mask = merge_df[cfg.match_status_col].eq(label)
+
+    for key, pob_string in agg.items():
+        try:
+            idx = (merge_index == key)
+        except ValueError:
+            # Skip malformed keys
+            continue
+
+        applicable = idx & merge_mask.values
+        merge_df.loc[applicable, cfg.updated_pob_col] = pob_string
+
+    return merge_df
+
+
+# =============================================================================
+# Public API – Phase 2 Step 1
+# =============================================================================
+
+def run_phase2_step1_matching(
+    merge_df: pd.DataFrame,
+    rar_df: pd.DataFrame,
+    cfg: Optional[Phase2Config] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Execute all Phase 2 – Step 1 matching tiers.
+
+    This function:
+        1) Initializes match columns on both datasets.
+        2) Identifies manual journal entries.
+        3) Performs tiered matching:
+               Match 1  – POB-level
+               Match 2a – Contract ID
+               Match 2b – Profitability Segment
+               Match 3a – Customer + Cost Element
+               Match 3b – Customer total
+        4) Labels Net 0 contracts in Merge.
+        5) Populates UpdatedPerformanceObligation from RAR for each match tier.
+
+    Month 1 vs Month 2 vs Month 3:
+        - Expect some unmatched License lines in early months (1 and 2) due to
+          timing cutoffs or posting delays.
+        - By month 3, the expectation is that these variances have cleared and
+          all License lines are matched by one of the tiers above, or
+          explicitly explained as Net 0 or Manual JE.
+
+    Returns
+    -------
+    (pd.DataFrame, pd.DataFrame)
+        Updated (merge_df, rar_df) with:
+            - Match 1 / 2a / 2b / 3a / 3b flag columns
+            - MatchStatus and MatchPopulation
+            - UpdatedPerformanceObligation populated where applicable
+    """
+    cfg = cfg or Phase2Config()
+
+    # 1) Initialize match-related columns
+    merge_df = _init_match_columns(merge_df, cfg)
+    rar_df = _init_match_columns(rar_df, cfg)
+
+    # Ensure amount column exists and is rounded consistently
+    for df in (merge_df, rar_df):
+        if cfg.amount_col not in df.columns:
+            raise KeyError(
+                f"Required amount column '{cfg.amount_col}' is missing."
+            )
+        df[cfg.amount_col] = _round_amount(df[cfg.amount_col], cfg.amount_precision)
+
+    # 2) Manual JEs & royalties are effectively taken out of the "license matching" pool
+    _mark_manual_journal_entries(merge_df, cfg)
+    _mark_manual_journal_entries(rar_df, cfg)
+
+    # -------------------------------------------------------------------------
+    # Match 1 – POB-level (ideally 1:1)
+    # -------------------------------------------------------------------------
+    merge_df, rar_df = _group_match(
+        left_df=merge_df,
+        right_df=rar_df,
+        group_cols=[cfg.pob_col],
+        label="Match 1 – POB",
+        cfg=cfg,
+    )
+
+    # For Match 1, Updated POB is simply the original POB
+    mask_m1 = merge_df[cfg.match_status_col].eq("Match 1 – POB")
+    merge_df.loc[mask_m1, cfg.updated_pob_col] = merge_df.loc[mask_m1, cfg.pob_col]
+
+    # -------------------------------------------------------------------------
+    # Match 2a – Contract ID
+    # -------------------------------------------------------------------------
+    merge_df, rar_df = _group_match(
+        left_df=merge_df,
+        right_df=rar_df,
+        group_cols=[cfg.contract_col],
+        label="Match 2a – Contract",
+        cfg=cfg,
+    )
+
+    merge_df = _update_pob_from_rar(
+        merge_df=merge_df,
+        rar_df=rar_df,
+        group_cols=[cfg.contract_col],
+        label="Match 2a – Contract",
+        cfg=cfg,
+    )
+
+    # Label Net 0 contracts after Contract-level matching
+    merge_df = _label_net_zero_contracts(merge_df, rar_df, cfg)
+
+    # -------------------------------------------------------------------------
+    # Match 2b – Profitability Segment
+    # -------------------------------------------------------------------------
+    merge_df, rar_df = _group_match(
+        left_df=merge_df,
+        right_df=rar_df,
+        group_cols=[cfg.profit_seg_col],
+        label="Match 2b – Profit Segment",
+        cfg=cfg,
+    )
+
+    merge_df = _update_pob_from_rar(
+        merge_df=merge_df,
+        rar_df=rar_df,
+        group_cols=[cfg.profit_seg_col],
+        label="Match 2b – Profit Segment",
+        cfg=cfg,
+    )
+
+    # -------------------------------------------------------------------------
+    # Match 3a – Customer + Cost Element
+    # -------------------------------------------------------------------------
+    merge_df, rar_df = _group_match(
+        left_df=merge_df,
+        right_df=rar_df,
+        group_cols=[cfg.customer_col, cfg.cost_element_col],
+        label="Match 3a – Customer+GL",
+        cfg=cfg,
+    )
+
+    merge_df = _update_pob_from_rar(
+        merge_df=merge_df,
+        rar_df=rar_df,
+        group_cols=[cfg.customer_col, cfg.cost_element_col],
+        label="Match 3a – Customer+GL",
+        cfg=cfg,
+    )
+
+    # -------------------------------------------------------------------------
+    # Match 3b – Customer total
+    # -------------------------------------------------------------------------
+    merge_df, rar_df = _group_match(
+        left_df=merge_df,
+        right_df=rar_df,
+        group_cols=[cfg.customer_col],
+        label="Match 3b – Customer",
+        cfg=cfg,
+    )
+
+    merge_df = _update_pob_from_rar(
+        merge_df=merge_df,
+        rar_df=rar_df,
+        group_cols=[cfg.customer_col],
+        label="Match 3b – Customer",
+        cfg=cfg,
+    )
+
+    # At this point:
+    #   - Most License lines should be matched across tiers.
+    #   - Remaining outliers (if any) are typically early-period timing items.
+    #   - UpdatedPerformanceObligation documents which RAR POBs tie to each line.
+
+    return merge_df, rar_df
+
+
+# =============================================================================
+# Optional CLI / script entrypoint (for local testing)
+# =============================================================================
+
+def main(
+    merge_path: Path,
+    rar_path: Path,
+    output_merge_path: Optional[Path] = None,
+    output_rar_path: Optional[Path] = None,
+) -> None:
+    """
+    Convenience entrypoint for local development/testing.
+
+    Example:
+        python phase2_matching.py \
+            data/output/phase1_merge.csv \
+            data/input/rar_detail.csv \
+            data/output/phase2_merge_matched.csv \
+            data/output/phase2_rar_matched.csv
+    """
+    print("--------------------------------------------------")
+    print("Phase 2 – Step 1: Matching Engine")
+    print("Loading input files...")
+    print(f"  Merge file (input): {merge_path}")
+    print(f"  RAR file   (input): {rar_path}")
+    print("--------------------------------------------------")
+
+    merge_df = pd.read_csv(merge_path)
+    rar_df = pd.read_csv(rar_path)
+
+    merge_df, rar_df = run_phase2_step1_matching(merge_df, rar_df)
+
+    output_merge_path = output_merge_path or merge_path.with_name(
+        merge_path.stem + "_phase2_matched.csv"
+    )
+    output_rar_path = output_rar_path or rar_path.with_name(
+        rar_path.stem + "_phase2_matched.csv"
+    )
+
+    merge_df.to_csv(output_merge_path, index=False)
+    rar_df.to_csv(output_rar_path, index=False)
+
+    print("\nPhase 2 – Step 1 matching complete.")
+    print("----------------------------------------")
+    print("Files saved:")
+    print(f"  Merge (with matches): {output_merge_path}")
+    print(f"  RAR   (with matches): {output_rar_path}")
+    print("\nNew columns created on BOTH datasets (Merge & RAR):")
+    for col in NEW_MATCH_COLUMNS:
+        print(f"  - {col}")
+    print("\nNotes:")
+    print("  • Months 1 and 2 may still show small variances after matching")
+    print("    due to timing cutoffs or system posting quirks.")
+    print("  • By Month 3, those variances should clear and all License lines")
+    print("    should be reconciled via Match 1–3 or explained as Net 0 / Manual JE.")
+    print("----------------------------------------\n")
+
+
+if __name__ == "__main__":
+    # Simple CLI parsing; adjust or replace with argparse as desired.
+    import sys
+
+    if len(sys.argv) < 3:
+        print(
+            "Usage: python phase2_matching.py <merge_csv> <rar_csv> "
+            "[<output_merge_csv> <output_rar_csv>]"
+        )
+        sys.exit(1)
+
+    merge_path_arg = Path(sys.argv[1])
+    rar_path_arg = Path(sys.argv[2])
+
+    out_merge_arg = Path(sys.argv[3]) if len(sys.argv) >= 4 else None
+    out_rar_arg = Path(sys.argv[4]) if len(sys.argv) >= 5 else None
+
+    main(
+        merge_path=merge_path_arg,
+        rar_path=rar_path_arg,
+        output_merge_path=out_merge_arg,
+        output_rar_path=out_rar_arg,
+    )
