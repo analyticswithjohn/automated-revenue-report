@@ -1,5 +1,5 @@
-Revenue Report Automation Pipeline
-Overview
+**Revenue Report Automation Pipeline
+Overview**
 
 This repository contains a multi-phase Python automation system designed to transform, reconcile, validate, and publish the corporate revenue reporting package.
 The automation replaces a historically manual, Excel-heavy workflow that relies on complex formulas, cross-file lookups, and tight quarter-end deadlines — a combination that frequently leads to human error and rework.
